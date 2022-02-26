@@ -1,14 +1,12 @@
 export const AND = 'and';
 export const EQUALS = '=';
+export const NOT_EQUALS = '!=';
 export const GREATER_THAN = '>';
-export const GREATER_EQ = '>=';
-export const IN = 'in';
-export const LESS_EQ = '<=';
 export const LESS_THAN = '<';
-export const NOT_IN = 'NOT_IN';
-export const NOT_STARTS_WITH = 'NOT_SW';
 export const OR = 'or';
-export const STARTS_WITH = 'SW';
+export const STARTS_WITH = 'starts';
+export const ENDS_WITH = 'ends';
+export const IN = 'in';
 
 export const SET_FILTER_DATA_COLUMNS = [
   { name: 'name', flex: 1 },
@@ -26,13 +24,27 @@ export default function filterRows(rows, columnMap, filter) {
   return applyFilter(rows, functor(columnMap, filter));
 }
 
-export function addFilter(existingFilter, filter) {
+export const filterClauses = (filter, clauses = []) => {
+  const { column, op, value, values, filters } = filter;
+  if (op === 'or' || op === 'and') {
+    filters.forEach((f) => clauses.push(...filterClauses(f)));
+  } else {
+    clauses.push({ column, op, value: value ?? values?.join(',') });
+  }
+  return clauses;
+};
+
+const DEFAULT_ADD_FILTER_OPTS = {
+  combineWith: AND
+};
+
+export function addFilter(existingFilter, filter, { combineWith = AND } = DEFAULT_ADD_FILTER_OPTS) {
   if (includesNoValues(filter)) {
-    const { colName } = filter;
-    existingFilter = removeFilterForColumn(existingFilter, { name: colName });
+    const { column } = filter;
+    existingFilter = removeFilterForColumn(existingFilter, { name: column });
   } else if (includesAllValues(filter)) {
     // A filter that returns all values is a way to remove filtering for this column
-    return removeFilterForColumn(existingFilter, { name: filter.colName });
+    return removeFilterForColumn(existingFilter, { name: filter.column });
   }
 
   if (!existingFilter) {
@@ -41,19 +53,21 @@ export function addFilter(existingFilter, filter) {
     return existingFilter;
   }
 
-  if (existingFilter.type === AND && filter.type === AND) {
+  console.log({ op: filter.op });
+
+  if (existingFilter.op === AND && filter.op === AND) {
     return { type: AND, filters: combine(existingFilter.filters, filter.filters) };
-  } else if (existingFilter.type === AND) {
+  } else if (existingFilter.op === AND) {
     const filters = replaceOrInsert(existingFilter.filters, filter);
-    return filters.length > 1 ? { type: AND, filters } : filters[0];
-  } else if (filter.type === AND) {
-    return { type: AND, filters: filter.filters.concat(existingFilter) };
+    return filters.length > 1 ? { op: AND, filters } : filters[0];
+  } else if (filter.op === AND) {
+    return { op: AND, filters: filter.filters.concat(existingFilter) };
   } else if (filterEquals(existingFilter, filter, true)) {
     return filter;
   } else if (sameColumn(existingFilter, filter)) {
     return merge(existingFilter, filter);
   } else {
-    return { type: AND, filters: [existingFilter, filter] };
+    return { op: AND, filters: [existingFilter, filter] };
   }
 }
 
@@ -78,22 +92,16 @@ export function functor(columnMap, filter) {
   switch (filter.type) {
     case IN:
       return testInclude(columnMap, filter);
-    case NOT_IN:
-      return testExclude(columnMap, filter);
     case EQUALS:
       return testEQ(columnMap, filter);
+    case NOT_EQUALS:
+      return !testEQ(columnMap, filter);
     case GREATER_THAN:
       return testGT(columnMap, filter);
-    case GREATER_EQ:
-      return testGE(columnMap, filter);
     case LESS_THAN:
       return testLT(columnMap, filter);
-    case LESS_EQ:
-      return testLE(columnMap, filter);
     case STARTS_WITH:
       return testSW(columnMap, filter);
-    case NOT_STARTS_WITH:
-      return testSW(columnMap, filter, true);
     case AND:
       return testAND(columnMap, filter);
     case OR:
@@ -135,27 +143,13 @@ function testGT(cols, f) {
   return (row) => row[cols[f.colName]] > f.value;
 }
 
-function testGE(cols, f) {
-  return (row) => row[cols[f.colName]] >= f.value;
-}
-
 function testLT(cols, f) {
   return (row) => row[cols[f.colName]] < f.value;
-}
-
-function testLE(cols, f) {
-  return (row) => row[cols[f.colName]] <= f.value;
 }
 
 function testInclude(cols, f) {
   // eslint-disable-next-line eqeqeq
   return (row) => f.values.findIndex((val) => val == row[cols[f.colName]]) !== -1;
-}
-
-// faster to convert values to a keyed map
-function testExclude(cols, f) {
-  // eslint-disable-next-line eqeqeq
-  return (row) => f.values.findIndex((val) => val == row[cols[f.colName]]) === -1;
 }
 
 function testEQ(cols, f) {
@@ -174,8 +168,6 @@ export function shouldShowFilter(filterColumnName, column) {
 function includesAllValues(filter) {
   if (!filter) {
     return false;
-  } else if (filter.type === NOT_IN && filter.values.length === 0) {
-    return true;
   } else if (filter.type === STARTS_WITH && filter.value === '') {
     return true;
   } else {
@@ -197,8 +189,6 @@ export function extendsFilter(f1 = null, f2 = null) {
       switch (f1.type) {
         case IN:
           return f2.values.length < f1.values.length && containsAll(f1.values, f2.values);
-        case NOT_IN:
-          return f2.values.length > f1.values.length && containsAll(f2.values, f1.values);
         case STARTS_WITH:
           return f2.value.length > f1.value.length && f2.value.indexOf(f1.value) === 0;
         // more cases here such as GT,LT
@@ -245,34 +235,32 @@ function extendsFilters(f1, f2) {
 // If we add an IN filter and there is an existing NOT_IN, we would always expect the IN
 // values to exist in the NOT_IN set (as long as user interaction is driving the filtering)
 function replaceOrInsert(filters, filter) {
-  const { type, colName, values } = filter;
-  if (type === IN || type === NOT_IN) {
-    const otherType = type === IN ? NOT_IN : IN;
-    // see if we have an 'other' entry
-    let idx = filters.findIndex((f) => f.type === otherType && f.colName === colName);
-    if (idx !== -1) {
-      const { values: existingValues } = filters[idx];
-      if (values.every((value) => existingValues.indexOf(value) !== -1)) {
-        if (values.length === existingValues.length) {
-          // we simply remove the existing 'other' filter ...
-          return filters.filter((f, i) => i !== idx);
-        } else {
-          // ... or strip the matching values from the 'other' filter values
-          let newValues = existingValues.filter((value) => !values.includes(value));
-          return filters.map((filter, i) =>
-            i === idx ? { ...filter, values: newValues } : filter
-          );
-        }
-      } else if (values.some((value) => existingValues.indexOf(value) !== -1)) {
-        console.log(`partial overlap between IN and NOT_IN`);
-      }
-    } else {
-      idx = filters.findIndex((f) => f.type === type && f.colName === filter.colName);
-      if (idx !== -1) {
-        return filters.map((f, i) => (i === idx ? merge(f, filter) : f));
-      }
-    }
-  }
+  // const { type, column, values } = filter;
+  // if (type === IN) {
+  //   let idx = filters.findIndex((f) => f.type === EQUALS && f.column === column);
+  //   if (idx !== -1) {
+  //     const { values: existingValues } = filters[idx];
+  //     if (values.every((value) => existingValues.indexOf(value) !== -1)) {
+  //       if (values.length === existingValues.length) {
+  //         // we simply remove the existing 'other' filter ...
+  //         return filters.filter((f, i) => i !== idx);
+  //       } else {
+  //         // ... or strip the matching values from the 'other' filter values
+  //         let newValues = existingValues.filter((value) => !values.includes(value));
+  //         return filters.map((filter, i) =>
+  //           i === idx ? { ...filter, values: newValues } : filter
+  //         );
+  //       }
+  //     } else if (values.some((value) => existingValues.indexOf(value) !== -1)) {
+  //       console.log(`partial overlap between IN and NOT_IN`);
+  //     }
+  //   } else {
+  //     idx = filters.findIndex((f) => f.type === type && f.colName === filter.colName);
+  //     if (idx !== -1) {
+  //       return filters.map((f, i) => (i === idx ? merge(f, filter) : f));
+  //     }
+  //   }
+  // }
 
   return filters.concat(filter);
 }
@@ -284,27 +272,7 @@ function merge(f1, f2) {
 
   if (includesNoValues(f2)) {
     return f2;
-  } else if ((t1 === IN && t2 === NOT_IN) || (t1 === NOT_IN && t2 === IN)) {
-    // do the two sets cancel each other out ?
-    if (f1.values.length === f2.values.length && f1.values.every((v) => f2.values.includes(v))) {
-      if (t1 === IN && t2 === NOT_IN) {
-        return {
-          colName: f1.colName,
-          type: IN,
-          values: []
-        };
-      } else {
-        return null;
-      }
-    } else if (f1.values.length > f2.values.length) {
-      if (f2.values.every((v) => f1.values.includes(v))) {
-        return {
-          ...f1,
-          values: f1.values.filter((v) => !f2.values.includes(v))
-        };
-      }
-    }
-  } else if (sameType === IN || sameType === NOT_IN) {
+  } else if (sameType === IN) {
     return {
       ...f1,
       values: f1.values.concat(f2.values.filter((v) => !f1.values.includes(v)))
@@ -312,11 +280,6 @@ function merge(f1, f2) {
   } else if (sameType === STARTS_WITH) {
     return {
       type: OR,
-      filters: [f1, f2]
-    };
-  } else if (sameType === NOT_STARTS_WITH) {
-    return {
-      type: AND,
       filters: [f1, f2]
     };
   }
@@ -473,7 +436,7 @@ export function removeFilterForColumn(sourceFilter, column) {
   }
 }
 
-const sameColumn = (f1, f2) => f1.colName === f2.colName;
+const sameColumn = (f1, f2) => f1.column === f2.column;
 
 export function filterEquals(f1, f2, strict = false) {
   if (f1 && f1) {
@@ -482,11 +445,7 @@ export function filterEquals(f1, f2, strict = false) {
       return isSameColumn;
     } else {
       return (
-        isSameColumn &&
-        f1.type === f2.type &&
-        f1.mode === f2.mode &&
-        f1.value === f2.value &&
-        sameValues(f1.values, f2.values)
+        isSameColumn && f1.op === f2.op && f1.value === f2.value && sameValues(f1.values, f2.values)
       );
     }
   } else {
@@ -498,8 +457,6 @@ export function filterEquals(f1, f2, strict = false) {
 function filterExtends(f1, f2) {
   if (f1.type === IN && f2.type === IN) {
     return f2.values.length < f1.values.length && containsAll(f1.values, f2.values);
-  } else if (f1.type === NOT_IN && f2.type === NOT_IN) {
-    return f2.values.length > f1.values.length && containsAll(f2.values, f1.values);
   } else {
     return false;
   }
